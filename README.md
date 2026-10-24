@@ -11,8 +11,10 @@ una cuenta guardada, muestra el tiempo restante y permite cerrar sesión.
 - Con el inicio automático activado, al detectar el portal entra solo con la
   cuenta marcada como predeterminada. Si no hay ninguna marcada, no entra
   solo: hace falta marcar una con la estrella.
-- Consulta el tiempo restante en el propio portal y lo muestra en la barra
-  (`1:05`) y en el panel (`1:05:09`), con cuenta atrás local entre consultas.
+- Consulta el tiempo restante en el propio portal y lo muestra en el panel
+  (`1:05:09`), con cuenta atrás local entre consultas. En la barra se ve solo
+  el icono; si quieres el tiempo al lado, activa la opción «Texto junto al
+  icono» en los ajustes del widget.
 - Guarda varias cuentas: usuario, etiqueta, cuenta predeterminada y contraseña
   en el **llavero del sistema** (secret-tool / gnome-keyring), nunca en texto
   plano.

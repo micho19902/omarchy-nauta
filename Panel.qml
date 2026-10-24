@@ -46,7 +46,7 @@ Panel {
   readonly property color urgent: bar ? bar.urgent : Commons.Color.urgent
   readonly property color dim: Qt.darker(foreground, 1.55)
   readonly property string fontFamily: bar ? bar.fontFamily : Style.font.family
-  readonly property string barLabelMode: setting("barLabel", "remaining")
+  readonly property string barLabelMode: setting("barLabel", "none")
   readonly property string barLabel: Model.barLabel(service.loggedIn, service.liveRemaining, barLabelMode)
   readonly property string barIcon: Model.iconGlyph(service.connState, service.loggedIn)
   readonly property string tooltip: "Nauta · " + Model.statusMeta(service.connState, service.loggedIn, service.liveRemaining, service.ssid)

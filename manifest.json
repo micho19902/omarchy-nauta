@@ -20,7 +20,7 @@
     "defaultSection": "right",
     "defaults": {
       "autoLogin": true,
-      "barLabel": "remaining",
+      "barLabel": "none",
       "refreshIntervalSec": 30
     },
     "schema": [
@@ -39,7 +39,7 @@
           "remaining",
           "none"
         ],
-        "defaultValue": "remaining",
+        "defaultValue": "none",
         "description": "Muestra el tiempo restante en la barra, o deja solo el icono."
       },
       {
