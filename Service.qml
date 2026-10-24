@@ -183,11 +183,12 @@ Item {
     }
   }
 
-  property string lastPortalSsid: ""
+  property string lastPortalKey: ""
+  property bool wasAuthenticated: false
+  property bool hadSession: false
 
   function applyStatus(data) {
     var prevState = connState
-    var prevSsid = ssid
 
     connState = String(data.state || "unknown")
     nautaNetwork = data.nauta === true
@@ -200,20 +201,38 @@ Item {
       remainingSeconds = Number(data.remainingSeconds || 0)
       sampledAt = Number(data.sampledAt || 0) * 1000
       autoFailures = 0
-      if (lastPortalSsid !== "") lastPortalSsid = ""
+      lastPortalKey = ""
+      wasAuthenticated = true
+      hadSession = true
     } else {
       remaining = ""
       remainingSeconds = 0
       sampledAt = 0
       if (String(data.user || "") !== "") activeUser = String(data.user)
-      if (prevState !== "portal" && connState === "portal" && nautaNetwork) {
-        if (lastPortalSsid !== ssid) {
-          lastPortalSsid = ssid
+
+      if (connState === "portal" && nautaNetwork === true) {
+        var portalKey = String(ssid || "nauta") + "|portal"
+        // Si veníamos autenticados y ahora pide portal -> sesión caída
+        if (hadSession && wasAuthenticated) {
+          if (lastPortalKey !== portalKey || true) {
+            lastPortalKey = portalKey
+            wasAuthenticated = false
+            hadSession = false
+            Quickshell.execDetached(["notify-send", "-a", "Nauta", "-i", "gcr-password", "Nauta: Autenticación requerida", "Hay que iniciar sesión en el portal de ETECSA para tener internet."])
+          }
+        } else if (prevState !== "portal" && lastPortalKey !== portalKey) {
+          // Primera vez que vemos este portal sin sesión
+          lastPortalKey = portalKey
+          wasAuthenticated = false
           Quickshell.execDetached(["notify-send", "-a", "Nauta", "-i", "gcr-password", "Nauta: Autenticación requerida", "Hay que iniciar sesión en el portal de ETECSA para tener internet."])
         }
-      }
-      if (connState !== "portal") {
-        lastPortalSsid = ""
+        // Si ya avisamos para este portal y seguimos ahí sin sesión -> no repetir
+      } else {
+        lastPortalKey = ""
+        if (connState !== "online") {
+          wasAuthenticated = false
+          hadSession = false
+        }
       }
     }
 
