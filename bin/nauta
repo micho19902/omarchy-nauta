@@ -1,0 +1,887 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""Nauta (ETECSA) captive-portal client for the Omarchy bar plugin.
+
+Every subcommand prints exactly one JSON object on stdout, so the QML side
+never has to parse prose. Exit status is 0 for handled results (including
+login failures, which carry ``{"ok": false, "error": "..."}``) and 1 only for
+unexpected crashes.
+
+No third-party imports: the plugin has to work on a fresh Omarchy install.
+Passwords live in the system keyring (secret-tool); accounts and the live
+portal session live in ~/.config/omarchy/nauta/.
+"""
+
+from __future__ import annotations
+
+import argparse
+import html
+import http.cookiejar as cookiejar
+import json
+import os
+import re
+import socket
+import ssl
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+PORTAL = "https://secure.etecsa.net:8443"
+PROBE_URL = "http://nmcheck.gnome.org/check_network_status.txt"
+PROBE_TEXT = "NetworkManager is online"
+DEFAULT_DOMAIN = "nauta.com.cu"
+KEYRING_SERVICE = "nauta"
+UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"
+
+# The portal serves a certificate that is not in the public trust stores, and
+# every known Nauta client talks to it with verification off. The data that
+# travels over it is the account password, so this is a real (accepted)
+# trade-off rather than an oversight: without it nothing works at all.
+SSL_CONTEXT = ssl.create_default_context()
+SSL_CONTEXT.check_hostname = False
+SSL_CONTEXT.verify_mode = ssl.CERT_NONE
+# The portal's certificate also fails OpenSSL's default security level (weak
+# RSA/SHA-1 parameters), which shows up as a bare "UNEXPECTED_EOF" during the
+# handshake. Drop to level 1, which is what curl negotiates by default here.
+try:
+    SSL_CONTEXT.set_ciphers("DEFAULT@SECLEVEL=1")
+except ssl.SSLError:
+    pass
+
+FORM_RE = re.compile(r"<form\b([^>]*)>(.*?)</form\s*>", re.I | re.S)
+INPUT_RE = re.compile(r"<input\b([^>]*?)/?>", re.I)
+ATTR_RE = re.compile(r"""([\w:-]+)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'>]+))""", re.I)
+UUID_RE = re.compile(r"ATTRIBUTE_UUID=([0-9A-Za-z]+)")
+OP_RE = re.compile(r"op=getLeftTime&op1=([^&\"']+)&op2=([0-9A-Za-z]+)")
+TIME_RE = re.compile(r"(\d{1,4})\s*:\s*(\d{1,2})\s*:\s*(\d{1,2})")
+
+ALERTS = {
+    "El nombre de usuario o contraseña son incorrectos.": "Usuario o contraseña incorrectos.",
+    "El usuario ya está conectado.": "La cuenta ya tiene una sesión abierta.",
+    "Su estado de cuenta es anormal.": "El estado de la cuenta es anormal.",
+    "No se pudo autorizar al usuario.": "No se pudo autorizar el usuario.",
+    "Ha iniciado sesión en una semana. Reajuste el tiempo.": "Debes reajustar el tiempo de la cuenta en el portal.",
+    "Se desconecta de forma anormal. Por favor, póngase en contacto con el administrador de la red.": "La red desconectó la sesión de forma anormal.",
+}
+
+
+class PortalError(Exception):
+    """Something the user should read, already in Spanish."""
+
+
+class SessionExpired(PortalError):
+    """The stored portal session is no longer usable."""
+
+
+# --------------------------------------------------------------- filesystem
+
+
+def config_dir() -> str:
+    override = os.environ.get("NAUTA_CONFIG_DIR")
+    path = override or os.path.join(os.path.expanduser("~"), ".config", "omarchy", "nauta")
+    os.makedirs(path, mode=0o700, exist_ok=True)
+    try:
+        os.chmod(path, 0o700)
+    except OSError:
+        pass
+    return path
+
+
+def accounts_path() -> str:
+    return os.path.join(config_dir(), "accounts.json")
+
+
+def state_path() -> str:
+    return os.path.join(config_dir(), "state.json")
+
+
+def read_json(path: str, fallback):
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            value = json.load(handle)
+        return value if isinstance(value, dict) else fallback
+    except (OSError, ValueError):
+        return fallback
+
+
+def write_json(path: str, data) -> None:
+    tmp = path + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        json.dump(data, handle, ensure_ascii=False, indent=2)
+        handle.write("\n")
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+
+
+def load_accounts() -> dict:
+    data = read_json(accounts_path(), {})
+    accounts = data.get("accounts")
+    if not isinstance(accounts, list):
+        accounts = []
+    clean = []
+    for entry in accounts:
+        if not isinstance(entry, dict):
+            continue
+        user = str(entry.get("user") or "").strip()
+        if user == "":
+            continue
+        clean.append({"user": user, "label": str(entry.get("label") or "").strip()})
+    default = str(data.get("default") or "").strip()
+    if default != "" and not any(a["user"] == default for a in clean):
+        default = ""
+    return {"version": 1, "default": default, "accounts": clean}
+
+
+def save_accounts(store: dict) -> None:
+    write_json(accounts_path(), store)
+
+
+def load_state() -> dict:
+    data = read_json(state_path(), {})
+    return data if data.get("user") and data.get("uuid") else {}
+
+
+def save_state(state: dict) -> None:
+    write_json(state_path(), state)
+
+
+def clear_state() -> None:
+    try:
+        os.remove(state_path())
+    except OSError:
+        pass
+
+
+# ------------------------------------------------------------------ keyring
+
+
+def keyring(*args: str, stdin_text: str | None = None) -> subprocess.CompletedProcess:
+    try:
+        return subprocess.run(
+            ["secret-tool", *args],
+            input=stdin_text,
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+    except FileNotFoundError:
+        raise PortalError("No está instalado secret-tool (libsecret).")
+    except subprocess.TimeoutExpired:
+        raise PortalError("El llavero del sistema no respondió.")
+    except OSError as exc:
+        raise PortalError("No se pudo usar el llavero: %s" % exc)
+
+
+def keyring_lookup(user: str) -> str:
+    result = keyring("lookup", "service", KEYRING_SERVICE, "username", user)
+    if result.returncode != 0:
+        return ""
+    return result.stdout.rstrip("\r\n")
+
+
+def keyring_store(user: str, password: str) -> None:
+    result = keyring(
+        "store",
+        "--label=Nauta %s" % user,
+        "service",
+        KEYRING_SERVICE,
+        "username",
+        user,
+        stdin_text=password + "\n",
+    )
+    if result.returncode != 0:
+        raise PortalError("No se pudo guardar la contraseña en el llavero.")
+
+
+def keyring_clear(user: str) -> None:
+    keyring("clear", "service", KEYRING_SERVICE, "username", user)
+
+
+# --------------------------------------------------------------------- http
+
+
+class Response:
+    def __init__(self, status: int, url: str, body: str):
+        self.status = status
+        self.url = url
+        self.body = body
+
+
+def opener_for(jar: cookiejar.CookieJar) -> urllib.request.OpenerDirector:
+    return urllib.request.build_opener(
+        urllib.request.HTTPCookieProcessor(jar),
+        urllib.request.HTTPSHandler(context=SSL_CONTEXT),
+    )
+
+
+def http(
+    url: str,
+    data: dict | None = None,
+    jar: cookiejar.CookieJar | None = None,
+    timeout: float = 12.0,
+    referer: str = PORTAL + "/",
+) -> Response:
+    jar = jar if jar is not None else cookiejar.CookieJar()
+    payload = None
+    if data is not None:
+        payload = urllib.parse.urlencode(data).encode("utf-8")
+    request = urllib.request.Request(url, data=payload)
+    request.add_header("User-Agent", UA)
+    request.add_header("Accept", "text/html,application/xhtml+xml,*/*;q=0.8")
+    request.add_header("Accept-Language", "es-ES,es;q=0.9,en;q=0.5")
+    request.add_header("Referer", referer)
+    if payload is not None:
+        request.add_header("Content-Type", "application/x-www-form-urlencoded")
+    try:
+        with opener_for(jar).open(request, timeout=timeout) as response:
+            raw = response.read()
+            return Response(response.status, response.geturl(), raw.decode("utf-8", "replace"))
+    except urllib.error.HTTPError as exc:
+        raw = exc.read()
+        return Response(exc.code, exc.geturl(), raw.decode("utf-8", "replace"))
+    except (urllib.error.URLError, socket.timeout, ssl.SSLError, ConnectionError) as exc:
+        reason = getattr(exc, "reason", exc)
+        raise PortalError("No se pudo contactar el portal Nauta (%s)." % reason)
+
+
+def attrs(text: str) -> dict:
+    found = {}
+    for match in ATTR_RE.finditer(text):
+        value = match.group(2)
+        if value is None:
+            value = match.group(3)
+        if value is None:
+            value = match.group(4) or ""
+        found[match.group(1).lower()] = html.unescape(value)
+    return found
+
+
+def input_fields(fragment: str) -> dict:
+    fields = {}
+    for match in INPUT_RE.finditer(fragment):
+        attributes = attrs(match.group(1))
+        name = attributes.get("name", "")
+        if name == "":
+            continue
+        kind = (attributes.get("type") or "text").lower()
+        if kind in ("button", "submit", "reset", "image", "file"):
+            continue
+        fields[name] = attributes.get("value", "")
+    return fields
+
+
+def parse_forms(body: str) -> list:
+    forms = []
+    for match in FORM_RE.finditer(body):
+        attributes = attrs(match.group(1))
+        forms.append(
+            {
+                "id": attributes.get("id", ""),
+                "action": attributes.get("action", ""),
+                "method": (attributes.get("method") or "post").lower(),
+                "fields": input_fields(match.group(2)),
+            }
+        )
+    return forms
+
+
+def login_form(body: str):
+    forms = parse_forms(body)
+    for form in forms:
+        if form["id"] == "formulario":
+            return form
+    for form in forms:
+        if "username" in form["fields"] or "password" in form["fields"]:
+            return form
+    return None
+
+
+def all_inputs(body: str) -> dict:
+    return input_fields(body)
+
+
+def normalize_url(action: str) -> str:
+    action = (action or "").strip()
+    if action == "":
+        return PORTAL + "/LoginServlet"
+    if action.startswith("http://") or action.startswith("https://"):
+        parts = urllib.parse.urlsplit(action)
+        path = re.sub(r"/{2,}", "/", parts.path)
+        return urllib.parse.urlunsplit((parts.scheme, parts.netloc, path, parts.query, parts.fragment))
+    return urllib.parse.urljoin(PORTAL + "/", action.lstrip("/"))
+
+
+def portal_message(body: str) -> str:
+    lower = body.lower()
+    if "errorop" in lower:
+        return "La operación no se pudo ejecutar; la sesión pudo caducar."
+    match = re.search(r"alert\s*\(\s*\"([^\"]+)\"\s*\)", body)
+    if match:
+        message = html.unescape(match.group(1)).strip()
+        return ALERTS.get(message, message)
+    match = re.search(r"logoutcallback\(\s*'([^']+)'", body, re.I)
+    if match and match.group(1).upper() != "SUCCESS":
+        return "El portal rechazó la operación (%s)." % match.group(1)
+    return ""
+
+
+def open_portal(jar: cookiejar.CookieJar):
+    page = http(PORTAL, jar=jar, timeout=12)
+    form = login_form(page.body)
+    if form is None:
+        # Older portal builds show a landing page first; submitting its own
+        # hidden inputs is what gets to the login form.
+        landing = all_inputs(page.body)
+        if landing:
+            page = http(PORTAL, data=landing, jar=jar, timeout=12)
+            form = login_form(page.body)
+    if form is None:
+        hint = portal_message(page.body)
+        raise PortalError(hint or "El portal no mostró el formulario de acceso.")
+    if not form["fields"].get("CSRFHW") or not form["fields"].get("wlanuserip"):
+        raise PortalError("El portal no devolvió los datos de la sesión (CSRFHW/wlanuserip).")
+    return form
+
+
+def cookie_value(jar: cookiejar.CookieJar, name: str) -> str:
+    for cookie in jar:
+        if cookie.name == name:
+            return cookie.value
+    return ""
+
+
+def jar_with_cookie(name: str, value: str) -> cookiejar.CookieJar:
+    jar = cookiejar.CookieJar()
+    if not value:
+        return jar
+    host = urllib.parse.urlsplit(PORTAL).hostname or "secure.etecsa.net"
+    cookie = cookiejar.Cookie(
+        version=0,
+        name=name,
+        value=value,
+        port=None,
+        port_specified=False,
+        domain=host,
+        domain_specified=True,
+        domain_initial_dot=False,
+        path="/",
+        path_specified=True,
+        secure=True,
+        expires=None,
+        discard=True,
+        comment=None,
+        comment_url=None,
+        rest={},
+        rfc2109=False,
+    )
+    jar.set_cookie(cookie)
+    return jar
+
+
+def do_login(user: str, password: str) -> dict:
+    jar = cookiejar.CookieJar()
+    form = open_portal(jar)
+
+    data = dict(form["fields"])
+    data["username"] = user
+    data["password"] = password
+
+    response = http(normalize_url(form["action"]), data=data, jar=jar, timeout=20)
+    match = UUID_RE.search(response.body)
+    if match is None:
+        message = portal_message(response.body)
+        if message:
+            raise PortalError(message)
+        raise PortalError("El portal no confirmó el inicio de sesión.")
+
+    op_match = OP_RE.search(response.body)
+    return {
+        "user": user,
+        "uuid": match.group(1),
+        "csrfhw": form["fields"].get("CSRFHW", ""),
+        "wlanuserip": form["fields"].get("wlanuserip", ""),
+        "jsessionid": cookie_value(jar, "JSESSIONID"),
+        "op1": urllib.parse.unquote(op_match.group(1)) if op_match else "",
+        "op2": op_match.group(2) if op_match else "",
+        "started": time.time(),
+    }
+
+
+def parse_seconds(text: str):
+    stripped = text.strip()
+    if stripped == "":
+        return None
+    if stripped.startswith("{"):
+        try:
+            data = json.loads(stripped)
+        except ValueError:
+            data = {}
+        for key in ("remaining", "remaining_time", "leftTime", "time"):
+            if key in data:
+                stripped = str(data[key])
+                break
+    match = TIME_RE.search(stripped)
+    if match is None:
+        return None
+    hours, minutes, seconds = (int(part) for part in match.groups())
+    return hours * 3600 + minutes * 60 + seconds
+
+
+def format_seconds(total: int) -> str:
+    total = max(0, int(total))
+    return "%d:%02d:%02d" % (total // 3600, (total % 3600) // 60, total % 60)
+
+
+def query_left(session: dict) -> tuple[int, str]:
+    jar = jar_with_cookie("JSESSIONID", str(session.get("jsessionid") or ""))
+    csrfhw = str(session.get("csrfhw") or "")
+    user = str(session.get("user") or "")
+
+    if session.get("op1") and session.get("op2"):
+        query = urllib.parse.urlencode(
+            {
+                "CSRFHW": csrfhw,
+                "op": "getLeftTime",
+                "op1": session["op1"],
+                "op2": session["op2"],
+            }
+        )
+        response = http(PORTAL + "/EtecsaQueryServlet?" + query, data={}, jar=jar, timeout=10)
+    else:
+        response = http(
+            PORTAL + "/EtecsaQueryServlet",
+            data={
+                "op": "getLeftTime",
+                "ATTRIBUTE_UUID": session.get("uuid", ""),
+                "CSRFHW": csrfhw,
+                "wlanuserip": session.get("wlanuserip", ""),
+                "username": user,
+            },
+            jar=jar,
+            timeout=10,
+        )
+
+    seconds = parse_seconds(response.body)
+    if seconds is not None:
+        return seconds, format_seconds(seconds)
+
+    lower = response.body.lower()
+    if "errorop" in lower or "logoutcallback" in lower or "loginurl" in response.url.lower():
+        raise SessionExpired("La sesión del portal caducó.")
+    raise PortalError(portal_message(response.body) or "El portal no devolvió el tiempo restante.")
+
+
+def do_logout(session: dict) -> str:
+    jar = jar_with_cookie("JSESSIONID", str(session.get("jsessionid") or ""))
+    query = urllib.parse.urlencode(
+        {
+            "CSRFHW": session.get("csrfhw", ""),
+            "username": session.get("user", ""),
+            "ATTRIBUTE_UUID": session.get("uuid", ""),
+            "wlanuserip": session.get("wlanuserip", ""),
+        }
+    )
+    response = http(PORTAL + "/LogoutServlet?" + query, jar=jar, timeout=12)
+    return response.body
+
+
+# ------------------------------------------------------------- connectivity
+
+
+def current_ssid() -> str:
+    try:
+        result = subprocess.run(
+            ["nmcli", "-t", "-f", "ACTIVE,SSID", "device", "wifi"],
+            capture_output=True,
+            text=True,
+            timeout=4,
+        )
+        for line in result.stdout.splitlines():
+            if line.startswith("yes:"):
+                return line.split(":", 1)[1]
+    except (OSError, subprocess.SubprocessError):
+        pass
+    try:
+        result = subprocess.run(["iwgetid", "-r"], capture_output=True, text=True, timeout=3)
+        return result.stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+PORTAL_MARKERS = ("secure.etecsa.net", "EtecsaQueryServlet", "nauta_etecsa", "id=\"formulario\"", "id='formulario'", "pc_login.jsp")
+
+
+def probe() -> tuple[str, str, bool]:
+    """Return (state, final_url, portal_markers_seen).
+
+    ``state`` is one of online / portal / offline / unknown.
+    """
+    try:
+        response = http(PROBE_URL, timeout=5, referer="")
+    except PortalError:
+        return "offline", "", False
+
+    body = response.body
+    host = (urllib.parse.urlsplit(response.url).hostname or "").lower()
+    hinted = any(marker.lower() in body.lower() for marker in PORTAL_MARKERS)
+
+    if hinted or "etecsa" in host:
+        return "portal", response.url, True
+    if response.url.split("?", 1)[0].rstrip("/") != PROBE_URL.split("?", 1)[0].rstrip("/"):
+        return "portal", response.url, False
+    if response.status == 200 and PROBE_TEXT in body:
+        return "online", response.url, False
+    if response.status in (200, 204):
+        return "online", response.url, False
+    return "unknown", response.url, False
+
+
+def looks_like_nauta(ssid: str, portal_url: str, hinted: bool) -> bool:
+    if hinted:
+        return True
+    host = (urllib.parse.urlsplit(portal_url).hostname or "").lower()
+    if "etecsa" in host:
+        return True
+    name = ssid.lower()
+    return "nauta" in name or "etecsa" in name
+
+
+# ---------------------------------------------------------------- accounts
+
+
+def normalize_user(user: str) -> str:
+    user = (user or "").strip()
+    if user == "":
+        raise PortalError("Escribe el usuario de Nauta.")
+    if "@" not in user:
+        user = user + "@" + DEFAULT_DOMAIN
+    local, _, domain = user.partition("@")
+    if local == "" or domain == "":
+        raise PortalError("El usuario no es válido.")
+    return local + "@" + domain.lower()
+
+
+def find_account(store: dict, user: str):
+    wanted = (user or "").strip().lower()
+    for account in store["accounts"]:
+        if account["user"].lower() == wanted:
+            return account
+    return None
+
+
+def accounts_view(store: dict) -> list:
+    view = []
+    for account in store["accounts"]:
+        view.append(
+            {
+                "user": account["user"],
+                "label": account["label"],
+                "hasPassword": keyring_lookup(account["user"]) != "",
+                "isDefault": account["user"] == store["default"],
+            }
+        )
+    return view
+
+
+def read_stdin_secret() -> str:
+    data = sys.stdin.read()
+    return data.rstrip("\r\n")
+
+
+# ---------------------------------------------------------------- commands
+
+
+def cmd_status(_args) -> dict:
+    ssid = current_ssid()
+    state, url, hinted = probe()
+    session = load_state()
+
+    result = {
+        "ok": True,
+        "state": state,
+        "ssid": ssid,
+        "portal": url if state == "portal" else "",
+        "nauta": looks_like_nauta(ssid, url, hinted),
+        "loggedIn": False,
+        "user": session.get("user", ""),
+        "remaining": "",
+        "remainingSeconds": 0,
+        "sampledAt": time.time(),
+    }
+
+    if session and state in ("online", "portal"):
+        try:
+            seconds, formatted = query_left(session)
+        except SessionExpired:
+            clear_state()
+            result["user"] = ""
+            result["error"] = "La sesión del portal caducó. Inicia sesión otra vez."
+        except PortalError as exc:
+            result["error"] = str(exc)
+        else:
+            result.update(
+                loggedIn=True,
+                user=session.get("user", ""),
+                remaining=formatted,
+                remainingSeconds=seconds,
+                sampledAt=time.time(),
+            )
+
+    return result
+
+
+def cmd_login(args) -> dict:
+    store = load_accounts()
+    account = find_account(store, args.account)
+    if account is None:
+        raise PortalError("Esa cuenta no está guardada.")
+    password = keyring_lookup(account["user"])
+    if password == "":
+        raise PortalError("No hay contraseña guardada para %s." % account["user"])
+
+    session = do_login(account["user"], password)
+    save_state(session)
+
+    result = {
+        "ok": True,
+        "loggedIn": True,
+        "state": "online",
+        "user": session["user"],
+        "remaining": "",
+        "remainingSeconds": 0,
+        "sampledAt": time.time(),
+    }
+    try:
+        seconds, formatted = query_left(session)
+    except PortalError as exc:
+        result["warning"] = str(exc)
+    else:
+        result.update(remaining=formatted, remainingSeconds=seconds)
+    return result
+
+
+def cmd_logout(_args) -> dict:
+    session = load_state()
+    if not session:
+        clear_state()
+        return {"ok": True, "loggedIn": False, "message": "No había una sesión guardada."}
+
+    body = do_logout(session)
+    lower = body.lower()
+    success = "success" in lower or "cerrad" in lower
+    if not success:
+        message = portal_message(body) or "El portal no confirmó el cierre de sesión."
+        return {"ok": False, "loggedIn": True, "error": message}
+
+    clear_state()
+    return {"ok": True, "loggedIn": False, "message": "Sesión cerrada."}
+
+
+def cmd_time(_args) -> dict:
+    session = load_state()
+    if not session:
+        raise SessionExpired("No hay una sesión activa.")
+    seconds, formatted = query_left(session)
+    return {
+        "ok": True,
+        "loggedIn": True,
+        "user": session.get("user", ""),
+        "remaining": formatted,
+        "remainingSeconds": seconds,
+        "sampledAt": time.time(),
+    }
+
+
+def cmd_accounts(_args) -> dict:
+    store = load_accounts()
+    return {"ok": True, "default": store["default"], "accounts": accounts_view(store)}
+
+
+def cmd_account_add(args) -> dict:
+    user = normalize_user(args.user)
+    password = read_stdin_secret() if not args.no_password else ""
+    if not args.no_password and password == "":
+        raise PortalError("La contraseña no puede estar vacía.")
+
+    store = load_accounts()
+    existing = find_account(store, user)
+    if existing is None:
+        store["accounts"].append({"user": user, "label": (args.label or "").strip()})
+    elif args.label is not None:
+        existing["label"] = args.label.strip()
+
+    if password != "":
+        keyring_store(user, password)
+    if args.default:
+        store["default"] = user
+
+    save_accounts(store)
+    return {
+        "ok": True,
+        "user": user,
+        "default": store["default"],
+        "accounts": accounts_view(store),
+    }
+
+
+def cmd_account_update(args) -> dict:
+    store = load_accounts()
+    account = find_account(store, args.user)
+    if account is None:
+        raise PortalError("Esa cuenta no está guardada.")
+
+    old_user = account["user"]
+    new_user = normalize_user(args.new_user) if args.new_user else old_user
+    if new_user.lower() != old_user.lower() and find_account(store, new_user) is not None:
+        raise PortalError("Ya hay otra cuenta guardada con ese usuario.")
+
+    password = "" if args.no_password else read_stdin_secret()
+
+    if args.label is not None:
+        account["label"] = args.label.strip()
+
+    if new_user != old_user:
+        # Move the secret to the new keyring entry before dropping the old one,
+        # and keep the default/state pointing at the account the user sees.
+        if password == "":
+            password = keyring_lookup(old_user)
+        keyring_clear(old_user)
+        if password != "":
+            keyring_store(new_user, password)
+        account["user"] = new_user
+        if store["default"] == old_user:
+            store["default"] = new_user
+        state = load_state()
+        if state.get("user") == old_user:
+            state["user"] = new_user
+            save_state(state)
+    elif password != "":
+        keyring_store(new_user, password)
+
+    save_accounts(store)
+    return {
+        "ok": True,
+        "user": new_user,
+        "default": store["default"],
+        "accounts": accounts_view(store),
+    }
+
+
+def cmd_account_remove(args) -> dict:
+    store = load_accounts()
+    account = find_account(store, args.user)
+    if account is None:
+        raise PortalError("Esa cuenta no está guardada.")
+    store["accounts"] = [a for a in store["accounts"] if a["user"] != account["user"]]
+    if store["default"] == account["user"]:
+        store["default"] = ""
+    save_accounts(store)
+    keyring_clear(account["user"])
+    if load_state().get("user") == account["user"]:
+        clear_state()
+    return {
+        "ok": True,
+        "default": store["default"],
+        "accounts": accounts_view(store),
+    }
+
+
+def cmd_account_default(args) -> dict:
+    store = load_accounts()
+    if args.clear:
+        store["default"] = ""
+    else:
+        account = find_account(store, args.user or "")
+        if account is None:
+            raise PortalError("Esa cuenta no está guardada.")
+        store["default"] = account["user"]
+    save_accounts(store)
+    return {
+        "ok": True,
+        "default": store["default"],
+        "accounts": accounts_view(store),
+    }
+
+
+def cmd_account_password(args) -> dict:
+    user = normalize_user(args.user)
+    password = read_stdin_secret()
+    if password == "":
+        raise PortalError("La contraseña no puede estar vacía.")
+    store = load_accounts()
+    if find_account(store, user) is None:
+        raise PortalError("Esa cuenta no está guardada.")
+    keyring_store(user, password)
+    return {"ok": True, "user": user, "accounts": accounts_view(store)}
+
+
+def cmd_ssid(_args) -> dict:
+    return {"ok": True, "ssid": current_ssid()}
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="nauta", description="Cliente del portal cautivo Nauta (ETECSA)")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    sub.add_parser("status", help="Estado de conexión, sesión y tiempo restante").set_defaults(func=cmd_status)
+
+    login = sub.add_parser("login", help="Inicia sesión con una cuenta guardada")
+    login.add_argument("--account", required=True, help="Usuario guardado (con o sin dominio)")
+    login.set_defaults(func=cmd_login)
+
+    sub.add_parser("logout", help="Cierra la sesión del portal").set_defaults(func=cmd_logout)
+    sub.add_parser("time", help="Consulta el tiempo restante").set_defaults(func=cmd_time)
+    sub.add_parser("ssid", help="SSID activo").set_defaults(func=cmd_ssid)
+    sub.add_parser("accounts", help="Lista las cuentas guardadas").set_defaults(func=cmd_accounts)
+
+    add = sub.add_parser("account-add", help="Guarda una cuenta (contraseña por stdin)")
+    add.add_argument("--user", required=True)
+    add.add_argument("--label", default=None)
+    add.add_argument("--default", action="store_true")
+    add.add_argument("--no-password", action="store_true")
+    add.set_defaults(func=cmd_account_add)
+
+    remove = sub.add_parser("account-remove", help="Elimina una cuenta")
+    remove.add_argument("--user", required=True)
+    remove.set_defaults(func=cmd_account_remove)
+
+    update = sub.add_parser("account-update", help="Modifica una cuenta guardada")
+    update.add_argument("--user", required=True)
+    update.add_argument("--new-user")
+    update.add_argument("--label")
+    update.add_argument("--no-password", action="store_true")
+    update.set_defaults(func=cmd_account_update)
+
+    default = sub.add_parser("account-default", help="Marca o desmarca la cuenta predeterminada")
+    default.add_argument("--user")
+    default.add_argument("--clear", action="store_true")
+    default.set_defaults(func=cmd_account_default)
+
+    password = sub.add_parser("account-password", help="Cambia la contraseña (por stdin)")
+    password.add_argument("--user", required=True)
+    password.set_defaults(func=cmd_account_password)
+
+    return parser
+
+
+def main() -> int:
+    parser = build_parser()
+    args = parser.parse_args()
+    try:
+        result = args.func(args)
+    except PortalError as exc:
+        result = {"ok": False, "error": str(exc)}
+    except KeyboardInterrupt:
+        result = {"ok": False, "error": "Cancelado."}
+    except Exception as exc:  # keep stdout JSON even when something unexpected breaks
+        result = {"ok": False, "error": "Error inesperado: %s" % exc}
+    print(json.dumps(result, ensure_ascii=False))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

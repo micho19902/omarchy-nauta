@@ -1,0 +1,57 @@
+{
+  "schemaVersion": 1,
+  "id": "mich.nauta",
+  "name": "Nauta",
+  "version": "0.1.0",
+  "author": "mich",
+  "license": "MIT",
+  "description": "Portal cautivo Nauta (ETECSA) en la barra: inicio de sesión, cuentas guardadas y tiempo restante.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Nauta",
+    "description": "Detecta el portal de Nauta al conectarte a la WiFi, inicia sesión con tus cuentas guardadas y muestra el tiempo restante.",
+    "category": "Network",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "autoLogin": true,
+      "barLabel": "remaining",
+      "refreshIntervalSec": 30
+    },
+    "schema": [
+      {
+        "key": "autoLogin",
+        "type": "boolean",
+        "label": "Iniciar sesión automáticamente",
+        "defaultValue": true,
+        "description": "Al detectar el portal de Nauta, entra con la cuenta marcada como predeterminada."
+      },
+      {
+        "key": "barLabel",
+        "type": "enum",
+        "label": "Texto junto al icono",
+        "options": [
+          "remaining",
+          "none"
+        ],
+        "defaultValue": "remaining",
+        "description": "Muestra el tiempo restante en la barra, o deja solo el icono."
+      },
+      {
+        "key": "refreshIntervalSec",
+        "type": "integer",
+        "label": "Intervalo de comprobación (segundos)",
+        "min": 10,
+        "max": 300,
+        "step": 5,
+        "defaultValue": 30,
+        "description": "Cada cuánto se comprueba la conexión y el tiempo restante. Con la sesión activa nunca baja de 60 segundos."
+      }
+    ]
+  }
+}
