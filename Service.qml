@@ -183,7 +183,12 @@ Item {
     }
   }
 
+  property string lastPortalSsid: ""
+
   function applyStatus(data) {
+    var prevState = connState
+    var prevSsid = ssid
+
     connState = String(data.state || "unknown")
     nautaNetwork = data.nauta === true
     ssid = String(data.ssid || "")
@@ -195,11 +200,21 @@ Item {
       remainingSeconds = Number(data.remainingSeconds || 0)
       sampledAt = Number(data.sampledAt || 0) * 1000
       autoFailures = 0
+      if (lastPortalSsid !== "") lastPortalSsid = ""
     } else {
       remaining = ""
       remainingSeconds = 0
       sampledAt = 0
       if (String(data.user || "") !== "") activeUser = String(data.user)
+      if (prevState !== "portal" && connState === "portal" && nautaNetwork) {
+        if (lastPortalSsid !== ssid) {
+          lastPortalSsid = ssid
+          Quickshell.execDetached(["notify-send", "-a", "Nauta", "-i", "gcr-password", "Nauta: Autenticación requerida", "Hay que iniciar sesión en el portal de ETECSA para tener internet."])
+        }
+      }
+      if (connState !== "portal") {
+        lastPortalSsid = ""
+      }
     }
 
     if (connState === "online") autoFailures = 0
